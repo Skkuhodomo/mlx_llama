@@ -1,236 +1,397 @@
 # Copyright © 2023 Apple Inc.
+
 import argparse
-import collections
-import copy
 import glob
 import json
-import shutil
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import torch
-from llama import Llama, ModelArgs, sanitize_config
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_unflatten
+from sentencepiece import SentencePieceProcessor
 
 
-def torch_to_mx(a: torch.Tensor, *, dtype: str) -> mx.array:
-    # bfloat16 is not numpy convertible. Upcast to float32 to avoid precision loss
-    a = a.to(torch.float32) if dtype == "bfloat16" else a.to(getattr(torch, dtype))
-    return mx.array(a.numpy(), getattr(mx, dtype))
+@dataclass
+class ModelArgs:
+    dim: int
+    n_layers: int
+    head_dim: int
+    hidden_dim: int
+    n_heads: int
+    n_kv_heads: int
+    norm_eps: float
+    vocab_size: int
+    rope_theta: float
+    rope_traditional: bool = True
 
 
-def llama(model_path, *, dtype: str):
-    SHARD_FIRST = ["wv", "wq", "wk", "w1", "w3", "output"]
-    SHARD_SECOND = ["tok_embeddings", "wo", "w2"]
-    SHARD_WEIGHTS = set(SHARD_FIRST + SHARD_SECOND)
+class RMSNorm(nn.Module):
+    def __init__(self, dims: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = mx.ones((dims,))
+        self.eps = eps
 
-    def shard_key(k):
-        keys = k.split(".")
-        if len(keys) < 2:
-            return None
-        return keys[-2]
+    def _norm(self, x):
+        return x * mx.rsqrt(x.square().mean(-1, keepdims=True) + self.eps)
 
-    def unshard(k, v):
-        wn = shard_key(k)
-        if wn not in SHARD_WEIGHTS:
-            return v
-        elif wn in SHARD_FIRST:
-            axis = 0
-        elif wn in SHARD_SECOND:
-            axis = 1
+    def __call__(self, x):
+        output = self._norm(x.astype(mx.float32)).astype(x.dtype)
+        return self.weight * output
+
+
+class Attention(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+
+        self.n_heads: int = args.n_heads
+        self.n_kv_heads: int = args.n_kv_heads
+
+        self.repeats = self.n_heads // self.n_kv_heads
+
+        self.scale = self.args.head_dim**-0.5
+
+        self.wq = nn.Linear(args.dim, args.n_heads * args.head_dim, bias=False)
+        self.wk = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wv = nn.Linear(args.dim, args.n_kv_heads * args.head_dim, bias=False)
+        self.wo = nn.Linear(args.n_heads * args.head_dim, args.dim, bias=False)
+        self.rope = nn.RoPE(
+            args.head_dim, traditional=args.rope_traditional, base=args.rope_theta
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Tuple[mx.array, mx.array]] = None,
+    ) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
+        B, L, D = x.shape
+
+        queries, keys, values = self.wq(x), self.wk(x), self.wv(x)
+
+        # Prepare the queries, keys and values for the attention computation
+        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+        def repeat(a):
+            a = mx.concatenate([mx.expand_dims(a, 2)] * self.repeats, axis=2)
+            return a.reshape([B, self.n_heads, L, -1])
+
+        keys, values = map(repeat, (keys, values))
+
+        if cache is not None:
+            key_cache, value_cache = cache
+            queries = self.rope(queries, offset=key_cache.shape[2])
+            keys = self.rope(keys, offset=key_cache.shape[2])
+            keys = mx.concatenate([key_cache, keys], axis=2)
+            values = mx.concatenate([value_cache, values], axis=2)
         else:
-            raise ValueError("Invalid weight name")
-        return mx.concatenate(v, axis=axis)
+            queries = self.rope(queries)
+            keys = self.rope(keys)
 
-    torch_files = glob.glob(str(model_path / "consolidated.*.pth"))
-    weights = collections.defaultdict(list)
-    for wf in torch_files:
-        state = torch.load(wf, map_location=torch.device("cpu"))
-        for k, v in state.items():
-            v = torch_to_mx(v, dtype=dtype)
-            state[k] = None  # free memory
-            if shard_key(k) in SHARD_WEIGHTS:
-                weights[k].append(v)
+        scores = (queries * self.scale) @ keys.transpose(0, 1, 3, 2)
+        if mask is not None:
+            scores += mask
+        scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
+        output = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.wo(output), (keys, values)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        self.w1 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+        self.w2 = nn.Linear(args.hidden_dim, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, args.hidden_dim, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.attention = Attention(args)
+        self.feed_forward = FeedForward(args=args)
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.args = args
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Tuple[mx.array, mx.array]] = None,
+    ) -> mx.array:
+        r, cache = self.attention(self.attention_norm(x), mask, cache)
+        h = x + r
+        r = self.feed_forward(self.ffn_norm(h))
+        out = h + r
+        return out, cache
+
+
+class Llama(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.vocab_size = args.vocab_size
+        self.tok_embeddings = nn.Embedding(args.vocab_size, args.dim)
+        self.layers = [TransformerBlock(args=args) for _ in range(args.n_layers)]
+        self.norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
+
+    def __call__(self, x):
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1])
+        mask = mask.astype(self.tok_embeddings.weight.dtype)
+
+        x = self.tok_embeddings(x)
+        for l in self.layers:
+            x, _ = l(x, mask)
+        x = self.norm(x)
+        return self.output(x)
+
+    def generate(self, x, temp=1.0):
+        def sample(logits):
+            if temp == 0:
+                return mx.argmax(logits, axis=-1)
             else:
-                weights[k] = v
+                return mx.random.categorical(logits * (1 / temp))
 
-    for k, v in weights.items():
-        weights[k] = unshard(k, v)
-    with open(model_path / "params.json", "r") as f:
-        params = json.loads(f.read())
-    return weights, params
+        cache = []
 
+        # Make an additive causal mask. We will need that to process the prompt.
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(x.shape[1])
+        mask = mask.astype(self.tok_embeddings.weight.dtype)
 
-def tiny_llama(model_path, *, dtype: str):
-    try:
-        import transformers
-    except ImportError:
-        print("The transformers package must be installed for this model conversion:")
-        print("pip install transformers")
-        exit(1)
+        # First we process the prompt x the same was as in __call__ but
+        # save the caches in cache
+        x = self.tok_embeddings(x)
+        for l in self.layers:
+            x, c = l(x, mask=mask)
+            # We store the per layer cache in a simple python list
+            cache.append(c)
+        x = self.norm(x)
+        # We only care about the last logits that generate the next token
+        y = self.output(x[:, -1])
+        y = sample(y)
 
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        str(model_path)
-    ).state_dict()
-    config = transformers.AutoConfig.from_pretrained(model_path)
+        # y now has size [1]
+        # Since MLX is lazily evaluated nothing is computed yet.
+        # Calling y.item() would force the computation to happen at
+        # this point but we can also choose not to do that and let the
+        # user choose when to start the computation.
+        yield y
 
-    # things to change
-    # 1. there's no "model." in the weight names
-    model = {k.replace("model.", ""): v for k, v in model.items()}
+        # Now we parsed the prompt and generated the first token we
+        # need to feed it back into the model and loop to generate the
+        # rest.
+        while True:
+            # Unsqueezing the last dimension to add a sequence length
+            # dimension of 1
+            x = y[:, None]
 
-    # 2. mlp is called feed_forward
-    model = {k.replace("mlp", "feed_forward"): v for k, v in model.items()}
+            x = self.tok_embeddings(x)
+            for i in range(len(cache)):
+                # We are overwriting the arrays in the cache list. When
+                # the computation will happen, MLX will be discarding the
+                # old cache the moment it is not needed anymore.
+                x, cache[i] = self.layers[i](x, mask=None, cache=cache[i])
+            x = self.norm(x)
+            y = sample(self.output(x[:, -1]))
 
-    # 3. up_proj, down_proj, gate_proj
-    model = {k.replace("down_proj", "w2"): v for k, v in model.items()}
-    model = {k.replace("up_proj", "w3"): v for k, v in model.items()}
-    model = {k.replace("gate_proj", "w1"): v for k, v in model.items()}
-
-    # 4. layernorms
-    model = {
-        k.replace("input_layernorm", "attention_norm"): v for k, v in model.items()
-    }
-    model = {
-        k.replace("post_attention_layernorm", "ffn_norm"): v for k, v in model.items()
-    }
-
-    # 5. lm head
-    model = {k.replace("lm_head", "output"): v for k, v in model.items()}
-
-    # 6. token emb
-    model = {k.replace("embed_tokens", "tok_embeddings"): v for k, v in model.items()}
-
-    # 7. attention
-    model = {k.replace("self_attn", "attention"): v for k, v in model.items()}
-    model = {k.replace("q_proj", "wq"): v for k, v in model.items()}
-    model = {k.replace("k_proj", "wk"): v for k, v in model.items()}
-    model = {k.replace("v_proj", "wv"): v for k, v in model.items()}
-    model = {k.replace("o_proj", "wo"): v for k, v in model.items()}
-
-    params = {}
-    params["dim"] = config.hidden_size
-    params["hidden_dim"] = config.intermediate_size
-    params["n_heads"] = config.num_attention_heads
-    if hasattr(config, "num_key_value_heads"):
-        params["n_kv_heads"] = config.num_key_value_heads
-    params["n_layers"] = config.num_hidden_layers
-    params["vocab_size"] = config.vocab_size
-    params["norm_eps"] = config.rms_norm_eps
-    params["rope_traditional"] = False
-    weights = {k: torch_to_mx(v, dtype=dtype) for k, v in model.items()}
-
-    return weights, params
+            yield y
 
 
-def quantize(weights, config, args):
-    quantized_config = copy.deepcopy(config)
+def tic():
+    return time.time()
 
-    # Load the model:
-    config = sanitize_config(config, weights)
+
+def toc(msg, start):
+    end = time.time()
+    return f"[INFO] {msg}: {end - start:.3f} s"
+
+
+def generate(args):
+    input("Press enter to start generation")
+    print("------")
+    print(args.prompt)
+    x = mx.array([[tokenizer.bos_id()] + tokenizer.encode(args.prompt)])
+    skip = 0
+    prompt_processing = None
+    tokens = []
+    start = tic()
+    for token in model.generate(x, args.temp):
+        tokens.append(token)
+
+        if len(tokens) == 1:
+            # Actually perform the computation to measure the prompt processing time
+            mx.eval(token)
+            prompt_processing = toc("Prompt processing", start)
+
+        if len(tokens) >= args.max_tokens:
+            break
+
+        elif (len(tokens) % args.write_every) == 0:
+            # It is perfectly ok to eval things we have already eval-ed.
+            mx.eval(tokens)
+            s = tokenizer.decode([t.item() for t in tokens])
+            print(s[skip:], end="", flush=True)
+            skip = len(s)
+
+    mx.eval(tokens)
+    full_gen = toc("Full generation", start)
+    s = tokenizer.decode([t.item() for t in tokens])
+    print(s[skip:], flush=True)
+    print("------")
+    print(prompt_processing)
+    print(full_gen)
+
+
+def few_shot_generate(args):
+    def possible_end(s):
+        word = "[Instruction]"
+        for i in range(len(word) - 1, 0, -1):
+            if s[-i:] == word[:i]:
+                return 0
+        if s[-len(word) :] == word:
+            return 1
+        return -1
+
+    def generate(question):
+        x = mx.array([[tokenizer.bos_id()] + tokenizer.encode(question)])
+        skip = 0
+        prompt_processing = None
+        tokens = []
+        start = tic()
+        for token in model.generate(x, args.temp):
+            tokens.append(token)
+
+            if len(tokens) == 1:
+                # Actually perform the computation to measure the prompt processing time
+                mx.eval(token)
+                prompt_processing = toc("Prompt processing", start)
+
+            if len(tokens) >= args.max_tokens:
+                break
+
+            mx.eval(tokens)
+            token_list = [t.item() for t in tokens]
+            s = tokenizer.decode(token_list)
+
+            end = possible_end(s)
+            if end == 0:
+                continue
+            if end == 1:
+                skip = len(s)
+                break
+
+            print(s[skip:], end="", flush=True)
+            skip = len(s)
+            if token_list[-1] == tokenizer.eos_id():
+                break
+
+        mx.eval(tokens)
+        full_gen = toc("Full generation", start)
+        s = tokenizer.decode([t.item() for t in tokens])
+        print(s[skip:], end="", flush=True)
+
+    print("[INFO] Loading few-shot examples from: {}".format(args.few_shot))
+    prompt = open(args.few_shot).read().strip()
+    while True:
+        question = input("Ask a question: ")
+        generate(prompt.replace("{}", question))
+        print()
+
+
+def sanitize_config(config, weights):
+    config.pop("model_type", None)
+    n_heads = config["n_heads"]
+    if "n_kv_heads" not in config:
+        config["n_kv_heads"] = n_heads
+    if "head_dim" not in config:
+        config["head_dim"] = config["dim"] // n_heads
+    if "hidden_dim" not in config:
+        config["hidden_dim"] = weights["layers.0.feed_forward.w1.weight"].shape[0]
+    if config.get("vocab_size", -1) < 0:
+        config["vocab_size"] = weights["output.weight"].shape[-1]
+    if "rope_theta" not in config:
+        config["rope_theta"] = 10000
+    unused = ["multiple_of", "ffn_dim_multiplier"]
+    for k in unused:
+        config.pop(k, None)
+    return config
+
+
+def load_model(model_path):
+    model_path = Path(model_path)
+
+    unsharded_weights_path = Path(model_path / "weights.npz")
+    if unsharded_weights_path.is_file():
+        print("[INFO] Loading model from {}.".format(unsharded_weights_path))
+        weights = mx.load(str(unsharded_weights_path))
+    else:
+        sharded_weights_glob = str(model_path / "weights.*.npz")
+        weight_files = glob.glob(sharded_weights_glob)
+        print("[INFO] Loading model from {}.".format(sharded_weights_glob))
+
+        if len(weight_files) == 0:
+            raise FileNotFoundError("No weights found in {}".format(model_path))
+
+        weights = {}
+        for wf in weight_files:
+            weights.update(mx.load(wf).items())
+
+    with open(model_path / "config.json", "r") as f:
+        config = sanitize_config(json.loads(f.read()), weights)
+        quantization = config.pop("quantization", None)
     model = Llama(ModelArgs(**config))
-    weights = tree_map(mx.array, weights)
+    if quantization is not None:
+        nn.QuantizedLinear.quantize_module(model, **quantization)
     model.update(tree_unflatten(list(weights.items())))
-
-    # Quantize the model:
-    nn.QuantizedLinear.quantize_module(model, args.q_group_size, args.q_bits)
-
-    # Update the config:
-    quantized_config["quantization"] = {
-        "group_size": args.q_group_size,
-        "bits": args.q_bits,
-    }
-    quantized_weights = dict(tree_flatten(model.parameters()))
-
-    return quantized_weights, quantized_config
-
-
-def make_shards(weights: dict, max_file_size_gibibyte: int = 15):
-    max_file_size_bytes = max_file_size_gibibyte << 30
-    shards = []
-    shard, shard_size = {}, 0
-    for k, v in weights.items():
-        if shard_size + v.nbytes > max_file_size_bytes:
-            shards.append(shard)
-            shard, shard_size = {}, 0
-        shard[k] = v
-        shard_size += v.nbytes
-    shards.append(shard)
-    return shards
+    tokenizer = SentencePieceProcessor(model_file=str(model_path / "tokenizer.model"))
+    return model, tokenizer
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert Llama weights to MLX")
+    parser = argparse.ArgumentParser(description="Llama inference script")
     parser.add_argument(
-        "--torch-path",
-        type=str,
-        help="Path to the PyTorch model.",
-    )
-    parser.add_argument(
-        "--mlx-path",
-        type=str,
+        "--model-path",
+        help="Path to the model weights and tokenizer",
         default="mlx_model",
-        help="Path to save the MLX model.",
     )
     parser.add_argument(
-        "--model-name",
-        help=(
-            "Name of the model to convert. Use 'llama' for models in the "
-            "Llama family distributed by Meta including Llama 1, Llama 2, "
-            "Code Llama, and Llama chat."
-        ),
-        choices=["tiny_llama", "llama"],
-        default="llama",
+        "--prompt",
+        help="The message to be processed by the model. Ignored when --few-shot is provided.",
+        default="In the beginning the Universe was created.",
     )
     parser.add_argument(
-        "-q",
-        "--quantize",
-        help="Generate a quantized model.",
-        action="store_true",
+        "--few-shot",
+        help="Read a few shot prompt from a file (as in `sample_prompt.txt`).",
     )
     parser.add_argument(
-        "--q-group-size",
-        help="Group size for quantization.",
-        type=int,
-        default=64,
+        "--max-tokens", "-m", type=int, default=100, help="How many tokens to generate"
     )
     parser.add_argument(
-        "--q-bits",
-        help="Bits per weight for quantization.",
-        type=int,
-        default=4,
+        "--write-every", type=int, default=1, help="After how many tokens to detokenize"
     )
     parser.add_argument(
-        "--dtype",
-        help="dtype for loading the torch model and input for quantization or saving the converted model. "
-        "The original weights are stored in bfloat16.",
-        type=str,
-        default="float16",
+        "--temp", type=float, default=0.0, help="The sampling temperature"
     )
+    parser.add_argument("--seed", type=int, default=0, help="The PRNG seed")
 
     args = parser.parse_args()
 
-    torch_path = Path(args.torch_path)
-    mlx_path = Path(args.mlx_path)
-    mlx_path.mkdir(parents=True, exist_ok=True)
+    mx.random.seed(args.seed)
 
-    print("[INFO] Loading")
-    weights, params = globals()[args.model_name](torch_path, dtype=args.dtype)
-    params["model_type"] = "llama"
-    if args.quantize:
-        print("[INFO] Quantizing")
-        weights, params = quantize(weights, params, args)
-
-    print("[INFO] Saving")
-    shutil.copyfile(
-        str(torch_path / "tokenizer.model"),
-        str(mlx_path / "tokenizer.model"),
-    )
-    shards = make_shards(weights)
-    if len(shards) == 1:
-        mx.savez(str(mlx_path / f"weights.npz"), **shards[0])
+    model, tokenizer = load_model(args.model_path)
+    if args.few_shot:
+        few_shot_generate(args)
     else:
-        for i, shard in enumerate(shards):
-            mx.savez(str(mlx_path / f"weights.{i:02d}.npz"), **shard)
-    with open(mlx_path / "config.json", "w") as fid:
-        json.dump(params, fid, indent=4)
+        generate(args)
