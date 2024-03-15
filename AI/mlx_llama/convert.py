@@ -127,7 +127,7 @@ def tiny_llama(model_path, *, dtype: str):
 
     return weights, params
 
-
+# 여기서 양자화 작업이 이루어집니다. 
 def quantize(weights, config, args):
     quantized_config = copy.deepcopy(config)
 
